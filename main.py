@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import uvicorn
 import subprocess
 import os
+from datetime import datetime, timedelta
 
 # --- Domain Models ---
 class ReportResponse(BaseModel):
@@ -11,8 +12,10 @@ class ReportResponse(BaseModel):
     date: str
 
 class CommitLog:
-    def __init__(self, message: str):
+    def __init__(self, message: str, date: str = "", repo_name: str = ""):
         self.message = message
+        self.date = date
+        self.repo_name = repo_name
 
 # --- Services ---
 class GitService:
@@ -34,16 +37,17 @@ class GitService:
             # Fallback if config is missing
             return ""
 
-    def get_commits_by_date(self, target_date: str) -> list[CommitLog]:
-        """Fetch commits for a specific date."""
+    def get_commits_by_range(self, since_date: str, until_date: str, display_name: str = "") -> list[CommitLog]:
+        """Fetch commits for a specific date range."""
         author = self.get_git_username()
-        # Using format: %s to only get commit subject
+        # Using format: %ad for date, %s for subject
         cmd = [
             'git', 'log',
-            '--pretty=format:%s',
+            '--all',
+            '--pretty=format:%as|%s',
             '--no-merges',
-            f'--since={target_date} 00:00:00',
-            f'--until={target_date} 23:59:59'
+            f'--since={since_date} 00:00:00',
+            f'--until={until_date} 23:59:59'
         ]
         
         if author:
@@ -59,7 +63,19 @@ class GitService:
             )
             
             lines = result.stdout.split('\n')
-            return [CommitLog(message=line.strip()) for line in lines if line.strip()]
+            # Use a list for deduplication by (date, message) content
+            unique_commits = []
+            seen = set()
+            for line in lines:
+                if '|' not in line:
+                    continue
+                commit_date, msg = line.strip().split('|', 1)
+                key = (commit_date, msg)
+                if msg and key not in seen:
+                    unique_commits.append(CommitLog(message=msg, date=commit_date, repo_name=display_name))
+                    seen.add(key)
+            
+            return unique_commits
             
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Git execution failed: {e.stderr}")
@@ -69,27 +85,45 @@ class GitService:
 class ReportService:
     """Handles report generation logic"""
     @staticmethod
-    def generate_daily_report(date: str, commits: list[CommitLog]) -> str:
-        content = f"【工作日报】\n日期：{date}\n\n"
-        
-        content += "一、今日完成工作：\n"
+    def generate_daily_report(date: str, commits: list[CommitLog], is_multi_day: bool = False) -> str:
         if not commits:
-            content += "1. 按计划推进相关研发工作。\n"
-        else:
-            for idx, commit in enumerate(commits, start=1):
-                content += f"{idx}. {commit.message}\n"
+            return ""
+        
+        # Group by Date, then by Repo
+        grouped = {}
+        for commit in commits:
+            d = commit.date
+            if d not in grouped:
+                grouped[d] = {}
+            
+            repo = commit.repo_name or "Other"
+            if repo not in grouped[d]:
+                grouped[d][repo] = []
+            grouped[d][repo].append(commit.message)
+            
+        # Sort dates descending
+        sorted_dates = sorted(grouped.keys(), reverse=True)
+        
+        content = ""
+        for d in sorted_dates:
+            if is_multi_day:
+                # Format to "3月13日："
+                try:
+                    dt = datetime.strptime(d, "%Y-%m-%d")
+                    date_header = dt.strftime("%-m月%-d日")
+                    content += f"{date_header}：\n"
+                except:
+                    content += f"{d}：\n"
+            
+            for repo_name, messages in grouped[d].items():
+                content += f"{repo_name}：\n"
+                for idx, msg in enumerate(messages, start=1):
+                    content += f"{idx}. {msg}\n"
+            
+            if is_multi_day:
+                content += "\n" # Spacing between days
                 
-        content += "\n二、遇到的问题与解决方案：\n"
-        content += "暂无阻塞性问题。\n"
-        
-        content += "\n三、明日工作计划：\n"
-        content += "1. 继续推进相关模块研发联调工作\n"
-        content += "2. 根据排期完成既定任务\n"
-        
-        content += "\n四、其他：\n"
-        content += "无\n"
-        
-        return content
+        return content.strip()
 
 # --- FastAPI App ---
 app = FastAPI(title="Daily Report Generator API")
@@ -103,27 +137,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Path to the MES-PC repository on the user's desktop
-MES_PC_REPO_PATH = os.path.expanduser("~/Desktop/mes-pc")
+# Configurable paths for the repositories on the user's desktop
+REPO_PATHS = [
+    os.path.expanduser("~/Desktop/mes-pc"),
+    os.path.expanduser("~/Desktop/x-mom-platform-pc"),
+    os.path.expanduser("~/Desktop/shxg-web"),
+]
 
 @app.get("/api/daily_report", response_model=ReportResponse, summary="Retrieve Git commits and generate daily report")
-def get_daily_report(date: str = Query(..., description="Target date in YYYY-MM-DD format")):
+def get_daily_report(
+    date: str = Query(..., description="Target date in YYYY-MM-DD format"),
+    days: int = Query(1, description="Number of days to summarize")
+):
     """
-    Generate a daily report by fetching git commits for the specific date.
+    Generate a daily report by fetching git commits from multiple repositories for a specific period.
     """
-    if not os.path.exists(MES_PC_REPO_PATH):
+    all_commits = []
+    found_any_repo = False
+    
+    try:
+        until_dt = datetime.strptime(date, "%Y-%m-%d")
+        since_dt = until_dt - timedelta(days=days-1)
+        since_date = since_dt.strftime("%Y-%m-%d")
+        until_date = until_dt.strftime("%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    for repo_path in REPO_PATHS:
+        if os.path.exists(repo_path):
+            found_any_repo = True
+            # Extract a simple name from the path (e.g., 'mes-pc' or 'shxg-web')
+            display_name = os.path.basename(repo_path).replace("-pc", "").replace("-web", "")
+            
+            git_service = GitService(repo_path=repo_path)
+            try:
+                repo_commits = git_service.get_commits_by_range(since_date, until_date, display_name=display_name)
+                all_commits.extend(repo_commits)
+            except Exception as e:
+                # Log or skip if one repo fails
+                print(f"Warning: Failed to fetch commits for {repo_path}: {e}")
+                continue
+
+    if not found_any_repo:
         raise HTTPException(
             status_code=500, 
-            detail=f"Repository not found at {MES_PC_REPO_PATH}. Please check the path."
+            detail=f"None of the configured repositories were found on the Desktop."
         )
 
-    git_service = GitService(repo_path=MES_PC_REPO_PATH)
-    try:
-        commits = git_service.get_commits_by_date(date)
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-        
-    report_content = ReportService.generate_daily_report(date, commits)
+    # Generate content from aggregated commits
+    report_content = ReportService.generate_daily_report(date, all_commits, is_multi_day=(days > 1))
     
     return ReportResponse(content=report_content, date=date)
 
