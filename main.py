@@ -139,8 +139,7 @@ app.add_middleware(
 
 # Configurable paths for the repositories on the user's desktop
 REPO_PATHS = [
-    os.path.expanduser("~/Desktop/mes-pc"),
-    os.path.expanduser("~/Desktop/x-mom-platform-pc"),
+    os.path.expanduser("~/Desktop/x-mom-pc"),
     os.path.expanduser("~/Desktop/shxg-web"),
 ]
 
